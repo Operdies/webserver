@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -e 
+
+# gcc -O3 -o proxy proxy.c
+[ -f config.h ] || cp config.def.h config.h
+gcc -O0 -g -o proxy proxy.c
+
+if [ "$1" = "run" ]; then 
+  ./proxy
+fi
