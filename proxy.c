@@ -4,28 +4,104 @@
  * 2. High cpu utilization bug in handle_client -- observed in -O3 build
  */
 
-
+#define _FILE_OFFSET_BITS 64
 #define _GNU_SOURCE
+#include "proxy.h"
 #include <assert.h>
+#include <bits/time.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <poll.h>
+#include <sys/poll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
-#include "proxy.h"
 
 /* static */ void unescape_string(char *str, int n);
 static struct header_list *get_header(struct header_list *headers, char *name);
 static void proxy_log(int loglevel, char *fmt, ...);
 
 #include "config.h"
+
+static unsigned char jellyfin_server_mac_address[] = {0xe0, 0x3f, 0x49,
+                                                      0xb4, 0x63, 0xe9};
+#define jellyfin_server_address "192.168.0.111"
+#define msleep(x) (usleep((x) * 1000))
+
+static void send_magic_packet(unsigned char mac[6]) {
+  unsigned char magic_packet[102];
+  int idx;
+
+  // Build magic packet
+  for (idx = 0; idx < 6; idx++)
+    magic_packet[idx] = 0xff;
+  for (; idx < sizeof(magic_packet); idx++)
+    magic_packet[idx] = mac[idx % 6];
+
+  struct sockaddr_in s = {
+      .sin_family = AF_INET,
+      .sin_port = htons(4000),
+      .sin_addr.s_addr = htonl(INADDR_BROADCAST),
+  };
+
+  int bcast_sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (bcast_sock == -1) {
+    perror("socket");
+    return;
+  }
+
+  int broadcastEnable = 1;
+  if (-1 == setsockopt(bcast_sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable,
+                       sizeof(broadcastEnable))) {
+    perror("enable broadcast");
+    goto error;
+  }
+
+  if (-1 == connect(bcast_sock, (struct sockaddr *)&s, sizeof(s))) {
+    perror("connect");
+    goto error;
+  }
+
+  int written = write(bcast_sock, magic_packet, sizeof(magic_packet));
+  if (written != sizeof(magic_packet)) {
+    perror("write");
+  }
+error:
+  close(bcast_sock);
+}
+
+static struct timespec last_active = {0};
+static int asleep = -1;
+static void on_activity() { clock_gettime(CLOCK_REALTIME, &last_active); }
+
+#define IDLE_SUSPEND_TIMER (60 * 15) // 15 minutes
+static void suspend_if_inactive() {
+  struct timespec now = {0};
+  clock_gettime(CLOCK_REALTIME, &now);
+  uint64_t inactive_time = now.tv_sec - last_active.tv_sec;
+  int do_suspend = inactive_time > IDLE_SUSPEND_TIMER;
+  proxy_log(DEBUG, "Currently idle for %d minutes and %d seconds",
+            inactive_time / 60, inactive_time % 60);
+  if (do_suspend && asleep != 1) {
+    proxy_log(DEBUG, "Suspending server due to inactivity.");
+    asleep = 1;
+    if (fork() == 0) {
+      system("ssh jelly@" jellyfin_server_address
+             " 'echo mem > /sys/power/state'");
+      exit(0);
+    }
+  }
+}
 
 void static_file_handler(struct handler *handler, struct client_options opts) {
   char *file = handler->file.path;
@@ -53,11 +129,12 @@ void static_file_handler(struct handler *handler, struct client_options opts) {
   size_t sent = 0;
   for (; sent < fs;) {
     int written = sendfile(opts.fd, filefd, offset, fs);
-    proxy_log(DEBUG, "sendfile %d mB", written / 1000000);
     if (written == -1) {
-      proxy_log(ERROR, "sendfile:");
+      // EPIPE is expected if the client disconnects
+      proxy_log(errno == EPIPE ? DEBUG : ERROR, "sendfile:", errno);
       break;
     }
+    proxy_log(DEBUG, "sendfile %d mB", written / 1000000);
     sent += written;
   }
   close(filefd);
@@ -91,12 +168,23 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
   sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
   if (sockfd < 0) {
+    proxy_log(ERROR, "socket:");
     goto server_error;
   }
 
-  if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-    goto server_error;
+  int connect_retries = 5;
+  int connected;
+  for (int i = 0; i < connect_retries; i++) {
+    connected = connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0;
+    if (connected) break;
+    proxy_log(ERROR, "(%d) connect:", i);
+    send_magic_packet(jellyfin_server_mac_address);
+    msleep(2000);
   }
+
+  if (!connected) 
+    goto server_error;
+  
 
   { /* forward headers */
     FILE *f = fdopen(dup(sockfd), "w");
@@ -128,6 +216,7 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
   };
 
   for (;;) {
+    on_activity();
     int n = poll(fds, 2, -1);
     if (n == -1) {
       perror("poll");
@@ -167,7 +256,6 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
 server_error:
   if (sockfd > 0)
     close(sockfd);
-  proxy_log(ERROR, "Proxy error:");
   char payload[] = "HTTP/1.0 501\r\n\r\n";
   write(opts.fd, payload, strlen(payload));
   return;
@@ -189,7 +277,7 @@ void unescape_string(char *str, int n) {
   int cursor = 0, i = 0;
   for (; i < n; i++) {
     if (str[i] == '%') {
-      if ((i+2) >= n) {
+      if ((i + 2) >= n) {
         break;
       }
       int c1 = str[i + 1];
@@ -353,7 +441,21 @@ void *handle_client_thread(void *arg) {
   return NULL;
 }
 
+static void sigpipe_handler(int signum) {
+  proxy_log(DEBUG, "Pipe handler triggered (%d).", signum);
+}
+
 int main(int argc, char *argv[]) {
+  clock_gettime(CLOCK_REALTIME, &last_active);
+  struct sigaction sa = {0};
+  sigemptyset(&sa.sa_mask);
+  sa.sa_handler = sigpipe_handler;
+  sa.sa_flags = SA_RESTART;
+  if (sigaction(SIGPIPE, &sa, NULL) == -1) {
+    perror("sigaction");
+    exit(1);
+  }
+
   struct sockaddr_in saddr = {.sin_family = AF_INET,
                               .sin_addr.s_addr = INADDR_ANY,
                               .sin_port = htons(SERVER_PORT)};
@@ -374,13 +476,19 @@ int main(int argc, char *argv[]) {
     proxy_log(FATAL, "bind:");
 
   listen(sockfd, BACKLOGSIZE);
+  struct pollfd pfd = {.fd = sockfd, .events = POLLIN};
   for (;;) {
-    clientfd = accept(sockfd, (struct sockaddr *)&caddr, &csize);
-    proxy_log(DEBUG, "Accepted connection.");
-    uint64_t fd = clientfd;
-    pthread_t thread_id;
-    pthread_create(&thread_id, NULL, handle_client_thread, (void *)fd);
-    pthread_detach(thread_id);
+    int n = poll(&pfd, 1, 10000);
+    if (n > 0) {
+      clientfd = accept(sockfd, (struct sockaddr *)&caddr, &csize);
+      proxy_log(DEBUG, "Accepted connection.");
+      uint64_t fd = clientfd;
+      pthread_t thread_id;
+      pthread_create(&thread_id, NULL, handle_client_thread, (void *)fd);
+      pthread_detach(thread_id);
+    } else {
+      suspend_if_inactive();
+    }
   }
   close(sockfd);
   return 0;

@@ -1,7 +1,6 @@
 #ifndef PROXY_H
 
 #define PIPE_SPLICE_COUNT (1 << 16)
-#define _FILE_OFFSET_BITS 64
 #define LENGTH(x) (sizeof(x) / sizeof((x)[0]))
 #define BACKLOGSIZE 20
 #define startswith(str, val) (strncmp(str, val, sizeof(val) - 1) == 0)

@@ -5,7 +5,9 @@ set -e
 # gcc -O3 -o proxy proxy.c
 [ -f config.h ] || cp config.def.h config.h
 gcc -O0 -g -o proxy proxy.c
+sudo setcap CAP_NET_BIND_SERVICE=+eip ./proxy
 
 if [ "$1" = "run" ]; then 
   ./proxy
 fi
+
