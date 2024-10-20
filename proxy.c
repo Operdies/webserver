@@ -231,11 +231,7 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
     struct header_list *h;
     h = opts.headers;
     for (; h; h = h->next) {
-      if (startswith(h->line, "Host:")) {
-        fprintf(f, "Host: %s:%d\r\n", address, portno);
-      } else {
-        fprintf(f, "%s", h->line);
-      }
+      fprintf(f, "%s", h->line);
     }
     fprintf(f, "\r\n");
     fclose(f);
