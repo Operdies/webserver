@@ -10,6 +10,7 @@ gcc -O0 -g -o proxy proxy.c || exit 1
   while true; do
     ./proxy
     echo "Exited D: ($?)"
+    sleep 1
   done;
 fi
 } & disown
