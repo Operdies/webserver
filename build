@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 
-set -e 
-
 # gcc -O3 -o proxy proxy.c
 [ -f config.h ] || cp config.def.h config.h
-gcc -O0 -g -o proxy proxy.c
+gcc -O0 -g -o proxy proxy.c || exit 1
 
-if [ "$1" = "run" ]; then 
-  if pgrep -x "proxy"; then
-    pkill -x "proxy"
-  fi
+{ if [ "$1" = "run" ]; then 
+  # Allow failures again
+  pkill -x "proxy"
   while true; do
     ./proxy
     echo "Exited D: ($?)"
   done;
 fi
-
+} & disown
