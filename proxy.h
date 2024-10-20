@@ -1,9 +1,13 @@
 #ifndef PROXY_H
 
+#define _GNU_SOURCE
+#include <netinet/in.h>
+
 #define PIPE_SPLICE_COUNT (1 << 16)
 #define LENGTH(x) (sizeof(x) / sizeof((x)[0]))
 #define BACKLOGSIZE 20
 #define startswith(str, val) (strncmp(str, val, sizeof(val) - 1) == 0)
+
 
 enum PROXY_LOG_LEVEL { FATAL = 1, ERROR, WARN, INFO, DEBUG, DIAG };
 
@@ -13,9 +17,14 @@ struct header_list {
   struct header_list *next;
 };
 
+struct client_connection {
+  int fd;
+  struct sockaddr_in client;
+};
+
 struct client_options {
   struct header_list *headers;
-  int fd;
+  struct client_connection *conn;
 };
 
 struct handler;
@@ -47,6 +56,7 @@ void redirect_handler(struct handler *handler, struct client_options opts);
 void static_file_handler(struct handler *handler, struct client_options opts);
 void file_download_handler(struct handler *handler, struct client_options opts);
 void proxy_pass_handler(struct handler *handler, struct client_options opts);
+void dummy_handler(struct handler *handler, struct client_options opts);
 
 #define PROXY_H
 #endif

@@ -36,9 +36,11 @@ static void proxy_log(int loglevel, char *fmt, ...);
 static unsigned char jellyfin_server_mac_address[] = {0xe0, 0x3f, 0x49,
                                                       0xb4, 0x63, 0xe9};
 #define jellyfin_server_address "192.168.0.111"
+static char server_address2[] = {192, 168, 0, 111};
 #define msleep(x) (usleep((x) * 1000))
 
 static void send_magic_packet(unsigned char mac[6]) {
+  proxy_log(DEBUG, "Sending magic packet");
   unsigned char magic_packet[102];
   int idx;
 
@@ -56,57 +58,90 @@ static void send_magic_packet(unsigned char mac[6]) {
 
   int bcast_sock = socket(AF_INET, SOCK_DGRAM, 0);
   if (bcast_sock == -1) {
-    perror("socket");
+    proxy_log(ERROR, "socket:");
     return;
   }
 
   int broadcastEnable = 1;
   if (-1 == setsockopt(bcast_sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable,
                        sizeof(broadcastEnable))) {
-    perror("enable broadcast");
+    proxy_log(ERROR, "enable broadcast:");
     goto error;
   }
 
   if (-1 == connect(bcast_sock, (struct sockaddr *)&s, sizeof(s))) {
-    perror("connect");
+    proxy_log(ERROR, "connect:");
     goto error;
   }
 
   int written = write(bcast_sock, magic_packet, sizeof(magic_packet));
   if (written != sizeof(magic_packet)) {
-    perror("write");
+    proxy_log(ERROR, "write:");
   }
 error:
   close(bcast_sock);
+}
+
+static int send_suspend_signal() {
+  int sockfd;
+  int portno = 1337;
+  struct sockaddr_in serv_addr = {.sin_family = AF_INET,
+                                  .sin_addr.s_addr =
+                                      *(uint32_t *)server_address2,
+                                  .sin_port = htons(portno)};
+  sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd == -1) {
+    proxy_log(ERROR, "socket:");
+    return 0;
+  }
+  if (-1 == connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr))) {
+    close(sockfd);
+    // The machine is already off, probably?
+    return 0;
+  } else {
+    char buf[100];
+    int n = read(sockfd, &buf, 100);
+    proxy_log(DEBUG, "suspend: %.*s", n, buf);
+  }
+  close(sockfd);
+  return 1;
 }
 
 static struct timespec last_active = {0};
 static int asleep = -1;
 static void on_activity() { clock_gettime(CLOCK_REALTIME, &last_active); }
 
-#define IDLE_SUSPEND_TIMER (60 * 15) // 15 minutes
-static void suspend_if_inactive() {
+static int inhibit_suspend() {
+  // TODO: Inhibit suspend if qbittorrent is currently downloading.
+  return 0;
+}
+
+#define IDLE_SUSPEND_MINUTES (30)
+static void *suspend_if_inactive(void *a) {
   struct timespec now = {0};
   clock_gettime(CLOCK_REALTIME, &now);
   uint64_t inactive_time = now.tv_sec - last_active.tv_sec;
-  int do_suspend = inactive_time > IDLE_SUSPEND_TIMER;
-  proxy_log(DEBUG, "Currently idle for %d minutes and %d seconds",
-            inactive_time / 60, inactive_time % 60);
-  if (do_suspend && asleep != 1) {
-    proxy_log(DEBUG, "Suspending server due to inactivity.");
+  int do_suspend = inactive_time > (IDLE_SUSPEND_MINUTES * 60) && !inhibit_suspend();
+  if (do_suspend) {
+    int did_suspend = send_suspend_signal();
+    if (did_suspend)
+      proxy_log(DEBUG, "Sent suspend signal to server.");
+    // if the call failed, assume it failed because the system was already
+    // suspended?
     asleep = 1;
-    if (fork() == 0) {
-      system("ssh jelly@" jellyfin_server_address
-             " 'echo mem > /sys/power/state'");
-      exit(0);
-    }
   }
+
+  return NULL;
+}
+
+void dummy_handler(struct handler *handler, struct client_options opts) {
+  dprintf(opts.conn->fd, "HTTP/1.0 200 OK\r\n\r\n");
 }
 
 void static_file_handler(struct handler *handler, struct client_options opts) {
   char *file = handler->file.path;
   char *host = get_header(opts.headers, "Host:")->line + strlen("Host: ");
-  proxy_log(DEBUG, "Static server %.*s -> %s\n", strlen(host) - 2, host, file);
+  proxy_log(DEBUG, "Static server %.*s -> %s", strlen(host) - 2, host, file);
 
   int filefd = open(file, O_RDONLY);
   if (filefd == -1) {
@@ -117,18 +152,18 @@ void static_file_handler(struct handler *handler, struct client_options opts) {
   size_t fs = lseek(filefd, 0, SEEK_END);
   lseek(filefd, 0, SEEK_SET);
 
-  dprintf(opts.fd, "HTTP/1.0 200 OK\r\nContent-Length: %zu\r\n", fs);
+  dprintf(opts.conn->fd, "HTTP/1.0 200 OK\r\nContent-Length: %zu\r\n", fs);
   for (struct header_list *h = handler->additional_headers; h; h = h->next) {
-    dprintf(opts.fd, "%s\r\n", h->line);
+    dprintf(opts.conn->fd, "%s\r\n", h->line);
   }
-  dprintf(opts.fd, "\r\n");
+  dprintf(opts.conn->fd, "\r\n");
 
   proxy_log(DEBUG, "Serve %zu bytes", fs);
 
   off_t *offset = NULL;
   size_t sent = 0;
   for (; sent < fs;) {
-    int written = sendfile(opts.fd, filefd, offset, fs);
+    int written = sendfile(opts.conn->fd, filefd, offset, fs);
     if (written == -1) {
       // EPIPE is expected if the client disconnects
       proxy_log(errno == EPIPE ? DEBUG : ERROR, "sendfile:", errno);
@@ -144,20 +179,21 @@ void redirect_handler(struct handler *handler, struct client_options opts) {
   char *address = handler->redirect.host;
   char *host = get_header(opts.headers, "Host:")->line + strlen("Host: ");
   int portno = handler->redirect.port;
-  proxy_log(DEBUG, "Redirect %.*s -> %s:%d\n", strlen(host) - 2, host, address,
+  proxy_log(DEBUG, "Redirect %.*s -> %s:%d", strlen(host) - 2, host, address,
             portno);
-  dprintf(opts.fd,
+  dprintf(opts.conn->fd,
           "HTTP/1.0 301 OK\r\n"
           "Location: http://%s:%d\r\n\r\n",
           address, portno);
 }
+
 
 void proxy_pass_handler(struct handler *handler, struct client_options opts) {
   char *address = handler->proxy.host;
   char *host = get_header(opts.headers, "Host:")->line + strlen("Host: ");
   int sockfd = 0;
   int portno = handler->proxy.port;
-  proxy_log(DEBUG, "Proxy %.*s -> %s:%d\n", strlen(host) - 2, host, address,
+  proxy_log(DEBUG, "Proxy %.*s -> %s:%d", strlen(host) - 2, host, address,
             portno);
   struct sockaddr_in serv_addr = {.sin_family = AF_INET,
                                   .sin_port = htons(portno)};
@@ -172,19 +208,23 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
     goto server_error;
   }
 
+  on_activity();
   int connect_retries = 5;
   int connected;
   for (int i = 0; i < connect_retries; i++) {
-    connected = connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0;
-    if (connected) break;
+    connected =
+        connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0;
+    if (connected)
+      break;
     proxy_log(ERROR, "(%d) connect:", i);
     send_magic_packet(jellyfin_server_mac_address);
     msleep(2000);
   }
 
-  if (!connected) 
+  if (!connected) {
+    dprintf(opts.conn->fd, "HTTP/1.1 503 Service Unavailable\r\n\r\n");
     goto server_error;
-  
+  }
 
   { /* forward headers */
     FILE *f = fdopen(dup(sockfd), "w");
@@ -212,39 +252,37 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
 
   struct pollfd fds[2] = {
       {.fd = sockfd, .events = POLLIN},
-      {.fd = opts.fd, .events = POLLIN},
+      {.fd = opts.conn->fd, .events = POLLIN},
   };
 
   for (;;) {
     on_activity();
     int n = poll(fds, 2, -1);
     if (n == -1) {
-      perror("poll");
+      proxy_log(ERROR, "poll");
       break;
     }
 
     if (fds[0].revents & POLLIN) {
       int rc = splice(fds[0].fd, NULL, pipefds[writefd], NULL,
                       PIPE_SPLICE_COUNT, SPLICE_F_MOVE | SPLICE_F_MORE);
+      if (rc == -1) proxy_log(ERROR, "splice read server:");
+      if (rc <= 0) break;
       int wc = splice(pipefds[readfd], NULL, fds[1].fd, NULL, rc,
                       SPLICE_F_MOVE | SPLICE_F_MORE);
-      assert(rc == wc);
-      proxy_log(DIAG, "splice out %d", wc);
-      if (rc <= 0) {
-        break;
-      }
+      if (wc == -1) proxy_log(ERROR, "splice write server:");
+      if (wc <= 0) break;
     }
 
     if (fds[1].revents & POLLIN) {
       int rc = splice(fds[1].fd, NULL, pipefds[writefd], NULL,
                       PIPE_SPLICE_COUNT, SPLICE_F_MOVE | SPLICE_F_MORE);
+      if (rc == -1) proxy_log(ERROR, "splice read client:");
+      if (rc <= 0) break;
       int wc = splice(pipefds[readfd], NULL, fds[0].fd, NULL, rc,
                       SPLICE_F_MOVE | SPLICE_F_MORE);
-      assert(rc == wc);
-      proxy_log(DIAG, "splice in  %d", wc);
-      if (rc <= 0) {
-        break;
-      }
+      if (wc == -1) proxy_log(ERROR, "splice write client:");
+      if (wc <= 0) break;
     }
   }
 
@@ -257,7 +295,7 @@ server_error:
   if (sockfd > 0)
     close(sockfd);
   char payload[] = "HTTP/1.0 501\r\n\r\n";
-  write(opts.fd, payload, strlen(payload));
+  write(opts.conn->fd, payload, strlen(payload));
   return;
 }
 
@@ -301,55 +339,57 @@ struct header_list *get_header(struct header_list *headers, char *name) {
   return NULL;
 }
 
+
+static FILE *logfile = NULL;
+// Leave some space for rolling
+static char logfilename[sizeof(LOGFILE) + 20];
+static int logfilecount = 0;
+
+static void roll_logfile() {
+  if (logfile)
+    fclose(logfile);
+  sprintf(logfilename, "%s.%d.%d", LOGFILE, getpid(), logfilecount);
+  logfilecount++;
+  logfile = fopen(logfilename, "w");
+}
+
 void proxy_log(int loglevel, char *fmt, ...) {
-  char *log_headers[] = {[WARN] = "\033[1;30;43m",  [DIAG] = "\033[1;30;47m",
-                         [DEBUG] = "\033[1;30;46m", [INFO] = "\033[1;30;44m",
-                         [ERROR] = "\033[1;30;41m", [FATAL] = "\033[1;30;41m"};
-
-  char *log_colors[] = {
-      [DEBUG] = "\033[1;36m", [DIAG] = "\033[1;37m",  [INFO] = "\033[1;34m",
-      [WARN] = "\033[1;33m",  [ERROR] = "\033[1;31m", [FATAL] = "\033[1;31m"};
-  char *reset_color = "\033[0m";
-
-  if (loglevel > LOGLEVEL)
-    return;
-  char *levels[] = {
-      [DEBUG] = "DEBUG", [INFO] = "INFO ", [WARN] = "WARN ",
-      [ERROR] = "ERROR", [DIAG] = "DIAG ", [FATAL] = "FATAL",
+  static char *levels[] = {
+    [DEBUG] = "DEBUG", [INFO] = " INFO", [WARN] = " WARN",
+    [ERROR] = "ERROR", [DIAG] = " DIAG", [FATAL] = "FATAL",
   };
 
-  char *b;
-  size_t bs;
-  FILE *f = open_memstream(&b, &bs);
+  if (loglevel > LOGLEVEL && loglevel != FATAL)
+    return;
+
+  flockfile(logfile);
+
+  if (ftell(logfile) > MAXLOGSIZE) {
+    fprintf(logfile, "Rolling logfile to %s.%d\n", LOGFILE, logfilecount);
+    roll_logfile();
+  }
+
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(f, fmt, ap);
-  va_end(ap);
-  fclose(f);
 
   time_t rawtime;
   struct tm *timeinfo;
-
   time(&rawtime);
   timeinfo = localtime(&rawtime);
-
   char timebuf[100] = {0};
   strftime(timebuf, sizeof(timebuf), "%H:%M:%S", timeinfo);
-  printf("\r%s[%s %s]%s ", log_headers[loglevel], timebuf, levels[loglevel],
-         reset_color);
+  fprintf(logfile, "[%s %s] ", timebuf, levels[loglevel]);
+  vfprintf(logfile, fmt, ap);
 
-  if (bs) {
-    char last = b[bs - 1];
-    printf("%s%s%s ", log_colors[loglevel], b, reset_color);
-    fflush(stdout);
-    if (last == ':') {
-      perror(NULL);
-    } else if (last != '\n') {
-      puts("");
-    }
+  va_end(ap);
+
+  if (fmt && fmt[strlen(fmt)-1] == ':') {
+    fprintf(logfile, " %s", strerror(errno));
   }
 
-  free(b);
+  fprintf(logfile, "\n");
+  fflush(logfile);
+  funlockfile(logfile);
 
   if (loglevel == FATAL)
     exit(1);
@@ -363,10 +403,10 @@ void free_headers(struct header_list *h) {
   }
 }
 
-void handle_client(int clientfd) {
+void handle_client(struct client_connection *conn) {
   int n_read;
 
-  FILE *f = fdopen(clientfd, "rw");
+  FILE *f = fdopen(dup(conn->fd), "r");
   char *line = NULL;
   size_t len = 0;
 
@@ -385,7 +425,8 @@ void handle_client(int clientfd) {
 
     if (strcmp(line, "\r\n") == 0)
       break;
-    proxy_log(DIAG, "[Header] %s", line);
+    int headerlen = strchrnul(line, '\r') - line;
+    proxy_log(DIAG, "[Header] %.*s", headerlen, line);
     struct header_list *header = calloc(1, sizeof(*headers));
     char *l = line;
 
@@ -401,7 +442,7 @@ void handle_client(int clientfd) {
 
   struct header_list *host = get_header(headers, "Host");
   if (!host) {
-    fprintf(stderr, "No host header found (?)\n");
+    proxy_log(ERROR, "No host header found (?)");
   } else {
     char *hostline = host->line + strlen("Host: ");
     int subdomain_len = 0;
@@ -409,8 +450,8 @@ void handle_client(int clientfd) {
     if (period)
       subdomain_len = period - hostline;
     struct client_options opts = {
-        .fd = clientfd,
         .headers = headers,
+        .conn = conn,
     };
     for (int i = 0; i < LENGTH(handlers); i++) {
       struct handler *h = &handlers[i];
@@ -432,12 +473,12 @@ void handle_client(int clientfd) {
 cleanup:
   free_headers(headers);
   fclose(f);
-  close(clientfd);
+  close(conn->fd);
+  free(conn);
 }
 
 void *handle_client_thread(void *arg) {
-  int clientfd = (int)((uint64_t)arg);
-  handle_client(clientfd);
+  handle_client((struct client_connection*)arg);
   return NULL;
 }
 
@@ -446,15 +487,15 @@ static void sigpipe_handler(int signum) {
 }
 
 int main(int argc, char *argv[]) {
+  roll_logfile();
+  proxy_log(INFO, "Server started!");
   clock_gettime(CLOCK_REALTIME, &last_active);
   struct sigaction sa = {0};
   sigemptyset(&sa.sa_mask);
   sa.sa_handler = sigpipe_handler;
   sa.sa_flags = SA_RESTART;
-  if (sigaction(SIGPIPE, &sa, NULL) == -1) {
-    perror("sigaction");
-    exit(1);
-  }
+  if (sigaction(SIGPIPE, &sa, NULL) == -1)
+    proxy_log(FATAL, "sigaction:");
 
   struct sockaddr_in saddr = {.sin_family = AF_INET,
                               .sin_addr.s_addr = INADDR_ANY,
@@ -481,26 +522,26 @@ int main(int argc, char *argv[]) {
     int n = poll(&pfd, 1, 10000);
     if (n > 0) {
       clientfd = accept(sockfd, (struct sockaddr *)&caddr, &csize);
-      proxy_log(DEBUG, "Accepted connection.");
-      uint64_t fd = clientfd;
+      uint32_t ca = caddr.sin_addr.s_addr;
+      proxy_log(DEBUG, "Accepted connection from %d.%d.%d.%d", ca & 0xff, ca >> 8 & 0xff, ca >> 16 & 0xff, ca >> 24 & 0xff);
       pthread_t thread_id;
-      pthread_create(&thread_id, NULL, handle_client_thread, (void *)fd);
-      pthread_detach(thread_id);
+      struct client_connection *conn = calloc(1, sizeof(*conn));
+      conn->fd = clientfd;
+      conn->client = caddr;
+      if (pthread_create(&thread_id, NULL, handle_client_thread, conn) == 0) {
+        pthread_detach(thread_id);
+      } else {
+        proxy_log(FATAL, "Unable to spawn thread:");
+      }
     } else {
-      suspend_if_inactive();
+      pthread_t thread_id;
+      if (pthread_create(&thread_id, NULL, suspend_if_inactive, 0) == 0) {
+        pthread_detach(thread_id);
+      } else {
+        proxy_log(FATAL, "Unable to spawn thread:");
+      }
     }
   }
   close(sockfd);
   return 0;
 }
-
-/* Example of how one might serve files */
-// void file_download_handler(struct handler *handler,
-//                            struct client_options opts) {
-//   dprintf(opts.fd,
-//           "HTTP/1.0 200 OK\r\n"
-//           "Content-Length: %zu\r\n"
-//           "Content-Disposition: attachment; filename=\"file.txt\"\r\n"
-//           "\r\n",
-//           filesize);
-// }
