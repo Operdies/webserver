@@ -447,12 +447,13 @@ void handle_client(struct client_connection *conn) {
     char *hostline = host->line + strlen("Host: ");
     int subdomain_len = 0;
     char *period = strchr(hostline, '.');
-    if (period)
-      subdomain_len = period - hostline;
+    if (!period) period = strchrnul(hostline, '\r');
+    subdomain_len = period - hostline;
     struct client_options opts = {
         .headers = headers,
         .conn = conn,
     };
+    int handled = 0;
     for (int i = 0; i < LENGTH(handlers); i++) {
       struct handler *h = &handlers[i];
       if (h->subdomain && subdomain_len &&
@@ -461,13 +462,16 @@ void handle_client(struct client_connection *conn) {
         proxy_log(DEBUG, "Host %.*s matched handler %s", strlen(hostline) - 2,
                   hostline, h->subdomain);
         h->handler(h, opts);
+        handled = 1;
         break;
       } else if (h->subdomain == NULL) {
         proxy_log(DEBUG, "Fallback handler matched");
         h->handler(h, opts);
         break;
+        handled = 1;
       }
     }
+    if (!handled) proxy_log(ERROR, "Request for host '%s' not handled.", hostline);
   }
 
 cleanup:
