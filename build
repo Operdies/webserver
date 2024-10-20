@@ -6,9 +6,14 @@ gcc -O0 -g -o proxy proxy.c || exit 1
 
 { if [ "$1" = "run" ]; then 
   # Allow failures again
-  pkill -x "proxy"
+  pkill -SIGTERM -x "proxy"
   while true; do
     ./proxy
+    #    SIGTERM           SIGINT
+    if [ $? = 143 ] || [ $? = 130 ]; then
+      echo "Exit by signal."
+      exit 0
+    fi
     echo "Exited D: ($?)"
     sleep 1
   done;
