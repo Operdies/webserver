@@ -7,8 +7,6 @@
 #define _FILE_OFFSET_BITS 64
 #define _GNU_SOURCE
 #include "proxy.h"
-#include <assert.h>
-#include <bits/time.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -19,7 +17,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/poll.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -138,6 +135,30 @@ void dummy_handler(struct handler *handler, struct client_options opts) {
   dprintf(opts.conn->fd, "HTTP/1.0 200 OK\r\n\r\n");
 }
 
+void send_file(int filefd, struct client_options opts,
+               struct header_list *headers) {
+  size_t fs = lseek(filefd, 0, SEEK_END);
+  lseek(filefd, 0, SEEK_SET);
+
+  dprintf(opts.conn->fd, "HTTP/1.0 200 OK\r\nContent-Length: %zu\r\n", fs);
+  for (struct header_list *h = headers; h; h = h->next) {
+    dprintf(opts.conn->fd, "%s\r\n", h->line);
+  }
+  dprintf(opts.conn->fd, "\r\n");
+
+  off_t *offset = NULL;
+  size_t sent = 0;
+  for (; sent < fs;) {
+    int written = sendfile(opts.conn->fd, filefd, offset, fs);
+    if (written == -1) {
+      // EPIPE is expected if the client disconnects
+      proxy_log(errno == EPIPE ? DEBUG : ERROR, "sendfile:", errno);
+      break;
+    }
+    sent += written;
+  }
+}
+
 void static_file_handler(struct handler *handler, struct client_options opts) {
   char *file = handler->file.path;
   char *host = get_header(opts.headers, "Host:")->line + strlen("Host: ");
@@ -149,29 +170,7 @@ void static_file_handler(struct handler *handler, struct client_options opts) {
     return;
   }
 
-  size_t fs = lseek(filefd, 0, SEEK_END);
-  lseek(filefd, 0, SEEK_SET);
-
-  dprintf(opts.conn->fd, "HTTP/1.0 200 OK\r\nContent-Length: %zu\r\n", fs);
-  for (struct header_list *h = handler->additional_headers; h; h = h->next) {
-    dprintf(opts.conn->fd, "%s\r\n", h->line);
-  }
-  dprintf(opts.conn->fd, "\r\n");
-
-  proxy_log(DEBUG, "Serve %zu bytes", fs);
-
-  off_t *offset = NULL;
-  size_t sent = 0;
-  for (; sent < fs;) {
-    int written = sendfile(opts.conn->fd, filefd, offset, fs);
-    if (written == -1) {
-      // EPIPE is expected if the client disconnects
-      proxy_log(errno == EPIPE ? DEBUG : ERROR, "sendfile:", errno);
-      break;
-    }
-    proxy_log(DEBUG, "sendfile %d mB", written / 1000000);
-    sent += written;
-  }
+  send_file(filefd, opts, handler->additional_headers);
   close(filefd);
 }
 
@@ -187,6 +186,57 @@ void redirect_handler(struct handler *handler, struct client_options opts) {
           address, portno);
 }
 
+void fileserver(struct handler *handler, struct client_options opts) {
+  char buf[1024];
+  char *get = get_header(opts.headers, "GET ")->line + strlen("GET ");
+  char *getend = get;
+  for (; *getend && *getend != ' ' && *(uint16_t*)getend != *(uint16_t*)"\r\n"; getend++);
+  *getend = 0;
+  if (strlen(get) == 0 || (strlen(get) == 1 && *get == '/')) {
+    get = "/index.html";
+  } else {
+    unescape_string(get, getend - get);
+  }
+
+  int i = 0;
+  for (; handler->file.path[i]; i++)
+    buf[i] = handler->file.path[i];
+  if (buf[i] == '/') i--;
+  strcpy(buf + i, get);
+
+  // snprintf(buf, sizeof(buf) - 1, "%.*s%s", n, path, get);
+  proxy_log(INFO, "GET %s", buf);
+
+  int fd = open(buf, O_RDONLY);
+  if (fd == -1) {
+    dprintf(opts.conn->fd, "HTTP/1.0 404 Not Found\r\n\r\n");
+    return;
+  }
+  send_file(fd, opts, handler->additional_headers);
+  close(fd);
+}
+
+int proxy_sync(int from, int to, int through[2], char *id) {
+  const int readfd = 0;
+  const int writefd = 1;
+  int received, sent;
+  if ((received = splice(from, NULL, through[writefd], NULL, PIPE_SPLICE_COUNT, SPLICE_F_MOVE)) <= 0) {
+    if (received == -1) {
+      proxy_log(ERROR, "(%s):", id);
+    }
+    return 0;
+  }
+  if ((sent = splice(through[readfd], NULL, to, NULL, received, SPLICE_F_MOVE)) <= 0) {
+    if (sent == -1)
+      proxy_log(ERROR, "(%s):", id);
+    return 0;
+  }
+  if (sent != received) {
+    proxy_log(ERROR, "(%s): Failed to splice full message. Received %d, sent %d:", id, received, sent);
+    return -1;
+  }
+  return received + sent;
+}
 
 void proxy_pass_handler(struct handler *handler, struct client_options opts) {
   char *address = handler->proxy.host;
@@ -209,14 +259,17 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
   }
 
   on_activity();
-  int connect_retries = 5;
+  int connect_retries = 1;
   int connected;
   for (int i = 0; i < connect_retries; i++) {
     connected =
         connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0;
     if (connected)
       break;
+
+    int retry = errno == ENETUNREACH;
     proxy_log(ERROR, "(%d) connect:", i);
+    if (!retry) break;
     send_magic_packet(jellyfin_server_mac_address);
     msleep(2000);
   }
@@ -237,10 +290,7 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
     fclose(f);
   }
 
-  const int readfd = 0;
-  const int writefd = 1;
   int pipefds[2];
-
   if (-1 == pipe(pipefds)) {
     proxy_log(ERROR, "pipe:");
     goto server_error;
@@ -260,31 +310,17 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
     }
 
     if (fds[0].revents & POLLIN) {
-      int rc = splice(fds[0].fd, NULL, pipefds[writefd], NULL,
-                      PIPE_SPLICE_COUNT, SPLICE_F_MOVE | SPLICE_F_MORE);
-      if (rc == -1) proxy_log(ERROR, "splice read server:");
-      if (rc <= 0) break;
-      int wc = splice(pipefds[readfd], NULL, fds[1].fd, NULL, rc,
-                      SPLICE_F_MOVE | SPLICE_F_MORE);
-      if (wc == -1) proxy_log(ERROR, "splice write server:");
-      if (wc <= 0) break;
+      if (proxy_sync(fds[0].fd, fds[1].fd, pipefds, "server -> client") <= 0) break;
     }
 
     if (fds[1].revents & POLLIN) {
-      int rc = splice(fds[1].fd, NULL, pipefds[writefd], NULL,
-                      PIPE_SPLICE_COUNT, SPLICE_F_MOVE | SPLICE_F_MORE);
-      if (rc == -1) proxy_log(ERROR, "splice read client:");
-      if (rc <= 0) break;
-      int wc = splice(pipefds[readfd], NULL, fds[0].fd, NULL, rc,
-                      SPLICE_F_MOVE | SPLICE_F_MORE);
-      if (wc == -1) proxy_log(ERROR, "splice write client:");
-      if (wc <= 0) break;
+      if (proxy_sync(fds[1].fd, fds[0].fd, pipefds, "client -> server") <= 0) break;
     }
   }
 
   close(sockfd);
-  close(pipefds[readfd]);
-  close(pipefds[writefd]);
+  close(pipefds[0]);
+  close(pipefds[1]);
   return;
 
 server_error:
@@ -335,7 +371,6 @@ struct header_list *get_header(struct header_list *headers, char *name) {
   return NULL;
 }
 
-
 static FILE *logfile = NULL;
 // Leave some space for rolling
 static char logfilename[sizeof(LOGFILE) + 20];
@@ -351,8 +386,8 @@ static void roll_logfile() {
 
 void proxy_log(int loglevel, char *fmt, ...) {
   static char *levels[] = {
-    [DEBUG] = "DEBUG", [INFO] = " INFO", [WARN] = " WARN",
-    [ERROR] = "ERROR", [DIAG] = " DIAG", [FATAL] = "FATAL",
+      [DEBUG] = "DEBUG", [INFO] = " INFO", [WARN] = " WARN",
+      [ERROR] = "ERROR", [DIAG] = " DIAG", [FATAL] = "FATAL",
   };
 
   if (loglevel > LOGLEVEL && loglevel != FATAL)
@@ -379,7 +414,7 @@ void proxy_log(int loglevel, char *fmt, ...) {
 
   va_end(ap);
 
-  if (fmt && fmt[strlen(fmt)-1] == ':') {
+  if (fmt && fmt[strlen(fmt) - 1] == ':') {
     fprintf(logfile, " %s", strerror(errno));
   }
 
@@ -424,16 +459,18 @@ void handle_client(struct client_connection *conn) {
     int headerlen = strchrnul(line, '\r') - line;
     proxy_log(DIAG, "[Header] %.*s", headerlen, line);
     struct header_list *header = calloc(1, sizeof(*headers));
-    char *l = line;
 
-    header->line = l;
-    line = NULL;
-    len = 0;
+    header->line = line;
 
     if (headers == NULL)
       headers = tail = header;
-    tail->next = header;
+    else {
+      tail->next = header;
+    }
     tail = header;
+
+    line = NULL;
+    len = 0;
   }
 
   struct header_list *host = get_header(headers, "Host");
@@ -443,7 +480,8 @@ void handle_client(struct client_connection *conn) {
     char *hostline = host->line + strlen("Host: ");
     int subdomain_len = 0;
     char *period = strchr(hostline, '.');
-    if (!period) period = strchrnul(hostline, '\r');
+    if (!period)
+      period = strchrnul(hostline, '\r');
     subdomain_len = period - hostline;
     struct client_options opts = {
         .headers = headers,
@@ -463,11 +501,12 @@ void handle_client(struct client_connection *conn) {
       } else if (h->subdomain == NULL) {
         proxy_log(DEBUG, "Fallback handler matched");
         h->handler(h, opts);
-        break;
         handled = 1;
+        break;
       }
     }
-    if (!handled) proxy_log(ERROR, "Request for host '%s' not handled.", hostline);
+    if (!handled)
+      proxy_log(ERROR, "Request for host '%s' not handled.", hostline);
   }
 
 cleanup:
@@ -478,7 +517,7 @@ cleanup:
 }
 
 void *handle_client_thread(void *arg) {
-  handle_client((struct client_connection*)arg);
+  handle_client((struct client_connection *)arg);
   return NULL;
 }
 
@@ -523,7 +562,8 @@ int main(int argc, char *argv[]) {
     if (n > 0) {
       clientfd = accept(sockfd, (struct sockaddr *)&caddr, &csize);
       uint32_t ca = caddr.sin_addr.s_addr;
-      proxy_log(DEBUG, "Accepted connection from %d.%d.%d.%d", ca & 0xff, ca >> 8 & 0xff, ca >> 16 & 0xff, ca >> 24 & 0xff);
+      proxy_log(DEBUG, "Accepted connection from %d.%d.%d.%d", ca & 0xff,
+                ca >> 8 & 0xff, ca >> 16 & 0xff, ca >> 24 & 0xff);
       pthread_t thread_id;
       struct client_connection *conn = calloc(1, sizeof(*conn));
       conn->fd = clientfd;

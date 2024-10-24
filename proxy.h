@@ -27,13 +27,9 @@ struct client_options {
   struct client_connection *conn;
 };
 
-struct handler;
-
-typedef void(handlerfunc)(struct handler *handler, struct client_options opts);
-
 struct handler {
   char *subdomain;
-  handlerfunc *handler;
+  void (*handler)(struct handler *handler, struct client_options opts);
   union {
     // Proxy scenario
     struct {
@@ -57,6 +53,7 @@ void static_file_handler(struct handler *handler, struct client_options opts);
 void file_download_handler(struct handler *handler, struct client_options opts);
 void proxy_pass_handler(struct handler *handler, struct client_options opts);
 void dummy_handler(struct handler *handler, struct client_options opts);
+void fileserver(struct handler *handler, struct client_options opts);
 
 #define PROXY_H
 #endif

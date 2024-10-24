@@ -2,15 +2,19 @@
 
 # gcc -O3 -o proxy proxy.c
 [ -f config.h ] || cp config.def.h config.h
-gcc -O0 -g -o proxy proxy.c || exit 1
+
+gcc -static -fPIC -O0 -g -o proxy proxy.c || exit 1
 
 { if [ "$1" = "run" ]; then 
   # Allow failures again
   pkill -SIGTERM -x "proxy"
   while true; do
-    ./proxy
+    ./proxy &
+    proxy=$!
+    tail -f proxylog.$proxy.0
+    wait -f -n -p pexit $proxy 
     #    SIGTERM           SIGINT
-    if [ $? = 143 ] || [ $? = 130 ]; then
+    if [ $pexit = 143 ] || [ $pexit = 130 ]; then
       echo "Exit by signal."
       exit 0
     fi
