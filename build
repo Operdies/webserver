@@ -4,14 +4,14 @@
 [ -f config.h ] || cp config.def.h config.h
 
 gcc -static -fPIC -O0 -g -o proxy proxy.c || exit 1
-
+sudo setcap CAP_NET_BIND_SERVICE=+eip ./proxy || exit 1
 { if [ "$1" = "run" ]; then 
   # Allow failures again
   pkill -SIGTERM -x "proxy"
   while true; do
     ./proxy &
     proxy=$!
-    tail -f proxylog.$proxy.0
+    tail -f /tmp/proxylog.$proxy.0
     wait -f -n -p pexit $proxy 
     #    SIGTERM           SIGINT
     if [ $pexit = 143 ] || [ $pexit = 130 ]; then

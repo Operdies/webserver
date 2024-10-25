@@ -239,18 +239,17 @@ int proxy_sync(int from, int to, int through[2], char *id) {
 }
 
 void proxy_pass_handler(struct handler *handler, struct client_options opts) {
-  char *address = handler->proxy.host;
   char *host = get_header(opts.headers, "Host:")->line + strlen("Host: ");
   int sockfd = 0;
   int portno = handler->proxy.port;
-  proxy_log(DEBUG, "Proxy %.*s -> %s:%d", strlen(host) - 2, host, address,
+  proxy_log(DEBUG, "Proxy %.*s -> %x:%d", strlen(host) - 2, host, handler->proxy.host,
             portno);
-  struct sockaddr_in serv_addr = {.sin_family = AF_INET,
-                                  .sin_port = htons(portno)};
-  struct hostent *server;
+  struct sockaddr_in serv_addr = {
+      .sin_family = AF_INET,
+      .sin_port = htons(portno),
+      .sin_addr.s_addr = htonl(handler->proxy.host),
+  };
 
-  server = gethostbyname(address);
-  memcpy(&serv_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
   sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
   if (sockfd < 0) {
@@ -267,7 +266,7 @@ void proxy_pass_handler(struct handler *handler, struct client_options opts) {
     if (connected)
       break;
 
-    int retry = errno == ENETUNREACH;
+    int retry = errno == ENETUNREACH || errno == EHOSTUNREACH;
     proxy_log(ERROR, "(%d) connect:", i);
     if (!retry) break;
     send_magic_packet(jellyfin_server_mac_address);
@@ -434,6 +433,15 @@ void free_headers(struct header_list *h) {
   }
 }
 
+struct cloudflare_headers {
+  char client[20];
+  char country[20];
+};
+struct cloudflare_headers cloudflare_headers = {
+  .client = "Cf-Connecting-Ip: ",
+  .country = "Cf-Ipcountry: ",
+};
+
 void handle_client(struct client_connection *conn) {
   int n_read;
 
@@ -474,6 +482,7 @@ void handle_client(struct client_connection *conn) {
   }
 
   struct header_list *host = get_header(headers, "Host");
+  struct header_list *client = get_header(headers, cloudflare_headers.client);
   if (!host) {
     proxy_log(ERROR, "No host header found (?)");
   } else {
@@ -487,9 +496,21 @@ void handle_client(struct client_connection *conn) {
         .headers = headers,
         .conn = conn,
     };
+
+    int is_public = 0;
+    if (client && client->line) {
+      char *end = strchrnul(client->line, '\r');
+      proxy_log(DEBUG, "Handling request from %.*s", end - client->line, client->line);
+      is_public = 1;
+    } else {
+      proxy_log(DEBUG, "Handling local request.");
+      is_public = 0;
+    }
+
     int handled = 0;
     for (int i = 0; i < LENGTH(handlers); i++) {
       struct handler *h = &handlers[i];
+      if (is_public && !h->public) continue;
       if (h->subdomain && subdomain_len &&
           strlen(h->subdomain) == subdomain_len &&
           strncmp(hostline, h->subdomain, subdomain_len) == 0) {
@@ -561,9 +582,6 @@ int main(int argc, char *argv[]) {
     int n = poll(&pfd, 1, 10000);
     if (n > 0) {
       clientfd = accept(sockfd, (struct sockaddr *)&caddr, &csize);
-      uint32_t ca = caddr.sin_addr.s_addr;
-      proxy_log(DEBUG, "Accepted connection from %d.%d.%d.%d", ca & 0xff,
-                ca >> 8 & 0xff, ca >> 16 & 0xff, ca >> 24 & 0xff);
       pthread_t thread_id;
       struct client_connection *conn = calloc(1, sizeof(*conn));
       conn->fd = clientfd;

@@ -29,12 +29,13 @@ struct client_options {
 
 struct handler {
   char *subdomain;
+  int public;
   void (*handler)(struct handler *handler, struct client_options opts);
   union {
     // Proxy scenario
     struct {
-      char *host;
-      int port;
+      uint64_t host;
+      uint32_t port;
     } proxy;
     struct {
       char *host;
